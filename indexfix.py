@@ -56,18 +56,23 @@ def FixEntry(entry, keys, stats, options):
 def Process(keys, reading, writing, options):
     stats = defaultdict(int)
     count = 0
-    unique = set()
+    indexes = defaultdict(set)
     for entry in bson.decode_file_iter(reading):
         count += 1
         new_entry, fixed = FixEntry(entry, keys, stats, options)
-        uid = entry.get("_id", None)
         if writing:
-            if (uid is None) or (uid not in unique):
-                unique.add(uid)
+            duplicate = []
+            for key in keys:
+                value = entry.get(key)
+                if value in indexes[key]:
+                    duplicate.append(key)
+                else:
+                    indexes[key].add(value)
+            if len(duplicate) == 0:
                 if not fixed or options.truncate:
                     writing.write(bson.BSON.encode(new_entry))
             else:
-                print("Skipping duplicate id:", uid)
+                print("Skipping duplicate:", duplicate)
 
     if options.verbose:
         pprint.pprint(stats)
