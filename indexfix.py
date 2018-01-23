@@ -13,14 +13,18 @@ MAX_LENGTH = 768   # 53 byte overhead?  Maximum is 1024 / characters with utf-8 
 TRUNC_LENGTH = 256
 
 
-def GetIndexKeys(basename):
+def GetIndexKeys(basename, options):
     keys = set()
     with open(basename + ".metadata.json", "r") as f:
         metadata = json.load(f)
-        #pprint.pprint(metadata)
+        if options.verbose > 1:
+            pprint.pprint(metadata)
         for field in metadata.get("indexes", []):
             for k in field["key"]:
                 keys.add(k)
+
+    if options.verbose:
+        print("keys:", keys)
 
     return keys
 
@@ -33,44 +37,47 @@ def SafeTooLarge(s):
         return True
 
 
-def FixEntry(entry, keys, stats):
+def FixEntry(entry, keys, stats, options):
     fixed = False
     for k, v in entry.items():
         if k in keys and isinstance(v, basestring):
             if SafeTooLarge(v):
                 #pprint.pprint(entry)
                 # import pdb; pdb.set_trace()
-                entry[k] = v[:TRUNC_LENGTH]
-                print("Truncated to:", repr(entry[k]))
+                if options.truncate:
+                    entry[k] = v[:TRUNC_LENGTH]
+                    if options.verbose > 1:
+                        print("Truncate:", repr(entry[k]))
                 stats[k] += 1
                 fixed = True
     return entry, fixed
 
 
-def Process(keys, reading, writing=None):
+def Process(keys, reading, writing, options):
     stats = defaultdict(int)
     count = 0
     unique = set()
     for entry in bson.decode_file_iter(reading):
         count += 1
-        new_entry, fixed = FixEntry(entry, keys, stats)
-        uid = entry["_id"]
+        new_entry, fixed = FixEntry(entry, keys, stats, options)
+        uid = entry.get("_id", None)
         if writing:
-            if uid not in unique:
+            if (uid is None) or (uid not in unique):
                 unique.add(uid)
-                writing.write(bson.BSON.encode(new_entry))
+                if not fixed or options.truncate:
+                    writing.write(bson.BSON.encode(new_entry))
             else:
                 print("Skipping duplicate id:", uid)
 
-    pprint.pprint(stats)
-    print("found {} records".format(count))
+    if options.verbose:
+        pprint.pprint(stats)
+    print("processed {} records".format(count))
 
 
-def FixFile(filename, dry_run):
+def FixFile(filename, options):
     basename = re.match("(.*)\\.bson", filename).group(1)
     print("name:", basename)
-    keys = GetIndexKeys(basename)
-    print("keys:", keys)
+    keys = GetIndexKeys(basename, options)
     in_name = basename + ".bson"
     out_name = basename + ".bson.renamed"
     temp_name = basename + ".bson.output"
@@ -81,9 +88,9 @@ def FixFile(filename, dry_run):
         writing = None
         try:
             reading = open(in_name, "rb")
-            if not dry_run:
+            if not options.dry_run:
                 writing = open(temp_name, "wb")
-            Process(keys, reading, writing)
+            Process(keys, reading, writing, options)
 
         finally:
             if reading:
@@ -99,8 +106,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="Increase output verbosity")
-    parser.add_argument("--all", action="store_true",
+    parser.add_argument("-a", "--all", action="store_true",
                         help="Fix all files")
+    parser.add_argument("--truncate", action="store_true",
+                        help="Attempt to truncate instead of removing too large items")
     parser.add_argument("--dry-run", action="store_true",
                         help="Not write any files - just check them")
     parser.add_argument("filename", nargs="*",
@@ -109,10 +118,12 @@ def main():
 
     if args.all:
         for matching in glob.glob("*.bson"):
-            FixFile(matching, args.dry_run)
+            FixFile(matching, args)
     else:
+        if len(args.filename) == 0:
+            parser.error("Specify a filename or --all to fix something")
         for name in args.filename:
-            FixFile(name, args.dry_run)
+            FixFile(name, args)
 
 
 if __name__ == "__main__":
