@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 from __future__ import print_function
+from builtins import str
 from collections import defaultdict
 import argparse
 import bson
@@ -9,8 +10,7 @@ import os.path
 import pprint
 import re
 
-MAX_LENGTH = 768   # 53 byte overhead?  Maximum is 1024 / characters with utf-8 encoding ...
-TRUNC_LENGTH = 256
+MAX_LENGTH = 768   # Maximum is 1024 - 53 byte overhead (at least).
 
 
 def GetIndexKeys(basename, options):
@@ -24,7 +24,7 @@ def GetIndexKeys(basename, options):
                 keys.add(k)
 
     if options.verbose:
-        print("keys:", keys)
+        print("  Index names:", ", ".join(sorted(keys)))
 
     return keys
 
@@ -37,68 +37,71 @@ def SafeTooLarge(s):
         return True
 
 
-def FixEntry(entry, keys, stats, options):
-    fixed = False
+def InvalidEntry(entry, keys, stats):
     for k, v in entry.items():
-        if k in keys and isinstance(v, basestring):
+        if k in keys and isinstance(v, str):
             if SafeTooLarge(v):
-                #pprint.pprint(entry)
-                # import pdb; pdb.set_trace()
-                if options.truncate:
-                    entry[k] = v[:TRUNC_LENGTH]
-                    if options.verbose > 1:
-                        print("Truncate:", repr(entry[k]))
                 stats[k] += 1
-                fixed = True
-    return entry, fixed
+                return True
+    return False
 
 
-def Process(keys, reading, writing, options):
+def Process(keys, reading, good, bad):
     stats = defaultdict(int)
     count = 0
     unique = set()
     for entry in bson.decode_file_iter(reading):
         count += 1
-        new_entry, fixed = FixEntry(entry, keys, stats, options)
+        invalid = InvalidEntry(entry, keys, stats)
         uid = entry.get("_id", None)
-        if writing:
-            if (uid is None) or (uid not in unique):
-                unique.add(uid)
-                if not fixed or options.truncate:
-                    writing.write(bson.BSON.encode(new_entry))
-            else:
-                print("Skipping duplicate id:", uid)
+        if good and bad:
+            if uid is not None:
+                if uid in unique:
+                    stats["_id(duplicate)"] += 1
+                    invalid = True
+                else:
+                    unique.add(uid)
 
-    if options.verbose:
-        pprint.pprint(stats)
-    print("processed {} records".format(count))
+            if invalid:
+                bad.write(bson.BSON.encode(entry))
+            else:
+                good.write(bson.BSON.encode(entry))
+
+    for k in sorted(stats.keys()):
+        print("    {}: {} violations".format(k, stats[k]))
+    print("  Total {} records processed".format(count))
 
 
 def FixFile(filename, options):
     basename = re.match("(.*)\\.bson", filename).group(1)
-    print("name:", basename)
+    print("Processing:", basename)
     keys = GetIndexKeys(basename, options)
     in_name = basename + ".bson"
-    out_name = basename + ".bson.renamed"
-    temp_name = basename + ".bson.output"
-    if os.path.exists(out_name) or os.path.exists(temp_name):
-        print("Skipping - output file already exists")
+    temp_name = basename + ".bson.temp"
+    bad_name = basename + ".bson.bad"
+    original_name = basename + ".bson.original"
+    if os.path.exists(temp_name) or os.path.exists(bad_name) or os.path.exists(original_name):
+        print("Skipping - found existing output files(.temp, .bad, .original)")
     else:
         reading = None
-        writing = None
+        good = None
+        bad = None
         try:
             reading = open(in_name, "rb")
             if not options.dry_run:
-                writing = open(temp_name, "wb")
-            Process(keys, reading, writing, options)
+                good = open(temp_name, "wb")
+                bad = open(bad_name, "wb")
+            Process(keys, reading, good, bad)
 
         finally:
             if reading:
                 reading.close()
-            if writing:
-                writing.close()
-        if writing:
-            os.rename(in_name, out_name)
+            if good:
+                good.close()
+            if bad:
+                bad.close()
+        if not options.dry_run:
+            os.rename(in_name, original_name)
             os.rename(temp_name, in_name)
 
 
@@ -108,8 +111,6 @@ def main():
                         help="Increase output verbosity")
     parser.add_argument("-a", "--all", action="store_true",
                         help="Fix all files")
-    parser.add_argument("--truncate", action="store_true",
-                        help="Attempt to truncate instead of removing too large items")
     parser.add_argument("--dry-run", action="store_true",
                         help="Not write any files - just check them")
     parser.add_argument("filename", nargs="*",
